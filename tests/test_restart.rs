@@ -1,0 +1,54 @@
+#![allow(non_snake_case)]
+
+use ruboy;
+use ruboy::cpu;
+use ruboy::memory::Mmu;
+use ruboy::opcodes::RegisterId::B;
+
+use crate::common::build_cartridge;
+
+mod common;
+
+macro_rules! rst_tests {
+    ($($name:ident: $value:expr,)*) => {
+    $(
+        #[test]
+        fn $name() {
+            let (opcode, expected_b) = $value;
+
+            let mut cartridge = build_cartridge(vec![
+                opcode, // RST nn
+            ]);
+
+            cartridge.content[0x00000..0x040].copy_from_slice(vec![
+                0x06, 0x01, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, // LD B, $01
+                0x06, 0x02, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, // LD B, $02
+                0x06, 0x03, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, // LD B, $03
+                0x06, 0x04, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, // LD B, $04
+                0x06, 0x05, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, // LD B, $05
+                0x06, 0x06, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, // LD B, $06
+                0x06, 0x07, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, // LD B, $07
+                0x06, 0x08, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, // LD B, $08
+            ].as_slice());
+
+            let mut cpu = cpu::init_cpu();
+            let mut mmu = Mmu::new(cartridge);
+
+            cpu.run(&mut mmu);
+
+            assert_eq!(expected_b, cpu.regs[B]);
+        }
+    )*
+    }
+}
+
+rst_tests! {
+    test_RST_00: (0xC7, 0x01),
+    test_RST_08: (0xCF, 0x02),
+    test_RST_10: (0xD7, 0x03),
+    test_RST_18: (0xDF, 0x04),
+    test_RST_20: (0xE7, 0x05),
+    test_RST_28: (0xEF, 0x06),
+    test_RST_30: (0xF7, 0x07),
+    test_RST_38: (0xFF, 0x08),
+}
