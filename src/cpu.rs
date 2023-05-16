@@ -1,10 +1,11 @@
 use std::ops::{BitAnd, BitXor, Index, IndexMut};
 
-use Command::*;
+use InstructionType::*;
 
 use crate::cpu::Flag::{C, H, N, Z};
 use crate::memory::Mmu;
-use crate::opcodes::{Command, FlagId, Operand, Register16Id, RegisterId};
+use crate::opcodes::{InstructionType, FlagId, Instruction, Operand, Register16Id, RegisterId};
+use crate::opcodes::Register16Id::HL;
 
 pub struct Cpu {
     /// CPU registers
@@ -145,7 +146,7 @@ impl FlagRegister {
         self.c = val & 0b00010000 > 0;
     }
 
-    pub fn get(&self, id: FlagId) -> bool {
+    pub fn get(&self, id: &FlagId) -> bool {
         match id {
             FlagId::Z => self.z,
             FlagId::NZ => !self.z,
@@ -180,7 +181,7 @@ pub fn init_cpu() -> Cpu {
 impl Cpu {
     pub fn run(self: &mut Cpu, mmu: &mut Mmu) {
         'execution: loop {
-            let opcode = Command::try_from((mmu[self.regs.pc], mmu[self.regs.pc + 1]))
+            let instr = Instruction::try_from((mmu[self.regs.pc], mmu[self.regs.pc + 1]))
                 .unwrap_or_else(|_| {
                     if mmu[self.regs.pc] == 0xCB {
                         panic!("Unsupported opcode {:#04x} {:#04x}", mmu[self.regs.pc], mmu[self.regs.pc + 1])
@@ -194,22 +195,19 @@ impl Cpu {
                          self.regs.pc, self.regs.sp,
                          self.regs.a, self.regs.b, self.regs.c, self.regs.d, self.regs.e, self.regs.h, self.regs.l,
                          self.regs[Z], self.regs[N], self.regs[H], self.regs[C],
-                         mmu[self.regs.pc], opcode, mmu[0xFF44]
+                         mmu[self.regs.pc], instr.mnemonic, mmu[0xFF44]
                 );
             }
 
-            if self.regs.pc == 0x48a9 {
-                //               panic!("the disco")
-            }
             if mmu[self.regs.pc] == 0xCB {
                 self.advance_pc(2);
             } else {
                 self.advance_pc(1);
             }
 
-            match opcode {
-                ADD(ref op) => {
-                    let n = self.get_operand(op, mmu);
+            match instr.kind {
+                ADD => {
+                    let n = self.get_operand(&instr.lhs.unwrap(), mmu);
                     let (add, carry) = calc_with_carry(vec![self.regs.a, n, 0], |a, b| a.overflowing_add(b));
 
                     self.regs[Z] = add == 0;
@@ -219,34 +217,37 @@ impl Cpu {
 
                     self.regs.a = add;
                 }
-                ADD_HL(reg) => {
-                    let hl = self.regs.get(Register16Id::HL);
-                    let n = self.regs.get(reg);
+                ADD16 => {
+                    if instr.mnemonic == "ADD SP,r8" {
+                        let n = self.read_8(mmu) as i8 as i16 as u16;
+                        let h = (self.regs.sp & 0x000F) + (n & 0x000F) > 0x000F;
+                        let c = (self.regs.sp & 0x00FF) + (n & 0x00FF) > 0x00FF;
 
-                    let hc = half_carry_16_add(hl, n, 0);
-                    let result = hl.overflowing_add(n);
+                        self.regs[Z] = false;
+                        self.regs[N] = false;
+                        self.regs[H] = h;
+                        self.regs[C] = c;
 
-                    self.regs[N] = false;
-                    self.regs[H] = hc;
-                    self.regs[C] = result.1;
+                        self.regs.sp = self.regs.sp.overflowing_add(n).0;
+                    } else {
+                        let lhs = &instr.lhs.unwrap();
+                        let rhs = &instr.rhs.unwrap();
+                        let left = self.get_16bit_operand(lhs, mmu);
+                        let right = self.get_16bit_operand(rhs, mmu);
 
-                    self.regs.set(Register16Id::HL, result.0);
+                        let hc = half_carry_16_add(left, right, 0);
+                        let result = left.overflowing_add(right);
+
+                        self.regs[N] = false;
+                        self.regs[H] = hc;
+                        self.regs[C] = result.1;
+
+                        self.set_16bit_value(mmu, lhs, result.0);
+                    }
                 }
-                ADD_SP => {
-                    let n = self.read_8(mmu) as i8 as i16 as u16;
-                    let h = (self.regs.sp & 0x000F) + (n & 0x000F) > 0x000F;
-                    let c = (self.regs.sp & 0x00FF) + (n & 0x00FF) > 0x00FF;
-
-                    self.regs[Z] = false;
-                    self.regs[N] = false;
-                    self.regs[H] = h;
-                    self.regs[C] = c;
-
-                    self.regs.sp = self.regs.sp.overflowing_add(n).0;
-                }
-                ADC(ref op) => {
+                ADC => {
                     let carry = if self.regs[C] { 1 } else { 0 };
-                    let n = self.get_operand(op, mmu);
+                    let n = self.get_operand(&instr.lhs.unwrap(), mmu);
                     let (add, new_carry) = calc_with_carry(vec![self.regs.a, n, carry], |a, b| a.overflowing_add(b));
 
                     self.regs[Z] = add == 0;
@@ -256,33 +257,30 @@ impl Cpu {
 
                     self.regs.a = add;
                 }
-                AND(ref op) => {
-                    let n = self.get_operand(op, mmu);
+                AND => {
+                    let n = self.get_operand(&instr.lhs.unwrap(), mmu);
                     self.regs.a = self.regs.a.bitand(n);
                     self.regs[Z] = self.regs.a == 0;
                     self.regs[N] = false;
                     self.regs[H] = true;
                     self.regs[C] = false;
                 }
-                BIT(bit, reg) => {
-                    let n = match reg {
-                        RegisterId::HL => mmu[self.regs.get(Register16Id::HL)],
-                        _ => self.regs[reg]
-                    };
+                BIT => {
+                    let bit = self.get_operand(&instr.lhs.unwrap(), mmu);
+                    let n = self.get_operand(&instr.rhs.unwrap(), mmu);
 
                     self.regs[Z] = n & (1 << bit) == 0;
                     self.regs[N] = false;
                     self.regs[H] = true;
                 }
                 CALL => {
-                    let addr = self.read_16(mmu);
-                    self.push_stack(self.regs.pc, mmu);
-                    self.regs.pc = addr;
-                }
-                CALL_flag(flag) => {
+                    let cond = match &instr.lhs.unwrap() {
+                        Operand::Flag(flag) => self.regs.flags.get(flag),
+                        _ => true
+                    };
                     let addr = self.read_16(mmu);
 
-                    if self.regs.flags.get(flag) {
+                    if cond {
                         self.push_stack(self.regs.pc, mmu);
                         self.regs.pc = addr;
                     }
@@ -292,8 +290,8 @@ impl Cpu {
                     self.regs[N] = false;
                     self.regs[H] = false;
                 }
-                CP(ref op) => {
-                    let n = self.get_operand(op, mmu);
+                CP => {
+                    let n = self.get_operand(&instr.lhs.unwrap(), mmu);
                     self.regs[Z] = self.regs.a == n;
                     self.regs[N] = true;
                     self.regs[H] = half_carry_8_sub(self.regs.a, n, 0);
@@ -335,7 +333,8 @@ impl Cpu {
                     self.regs.flags.h = false;
                     self.regs.flags.c = added >= 0x60;
                 }
-                DEC(op) => {
+                DEC => {
+                    let op = instr.lhs.unwrap();
                     match op {
                         Operand::Register16(reg) => self.regs.set(reg, self.regs.get(reg).wrapping_sub(1)),
                         Operand::IndirectAddress(Register16Id::HL) => {
@@ -360,7 +359,8 @@ impl Cpu {
                 }
                 DI => {} // TODO
                 EI => {} // TODO
-                INC(reg) => {
+                INC => {
+                    let reg = instr.lhs.unwrap();
                     match reg {
                         Operand::Register16(reg) => {
                             let n = self.regs.get(reg);
@@ -387,94 +387,74 @@ impl Cpu {
                     }
                 }
                 JP => {
-                    let addr = self.read_16(mmu);
-                    self.set_pc(addr);
-                }
-                JP_flag(flag) => {
-                    let addr = self.read_16(mmu);
-                    if self.regs.flags.get(flag) {
-                        self.set_pc(addr)
+                    let lhs = &instr.lhs.unwrap();
+                    let cond = match lhs {
+                        Operand::Flag(flag) => self.regs.flags.get(flag),
+                        _ => true
+                    };
+
+                    let addr = match lhs {
+                        Operand::Flag(_) => self.get_16bit_operand( &instr.rhs.unwrap(), mmu),
+                        _ => self.get_16bit_operand( lhs, mmu),
+                    };
+                    if cond {
+                        self.set_pc(addr);
                     }
                 }
-                JP_HL => self.set_pc(self.regs.get(Register16Id::HL)),
                 JR => {
+                    let cond = match &instr.lhs.unwrap() {
+                        Operand::Flag(flag) => self.regs.flags.get(flag),
+                        _ => true
+                    };
+
                     let offset = self.read_8(mmu);
                     if offset as i8 == -2 {
                         // JR loop, used by test ROMs to indicate end of tests
                         break 'execution;
                     }
-                    self.advance_pc(offset as i8 as i16);
-                }
-                JR_flag(flag) => {
-                    let offset = self.read_8(mmu);
-                    if self.regs.flags.get(flag) {
-                        self.advance_pc(offset as i8 as i16)
+                    if cond {
+                        self.advance_pc(offset as i8 as i16);
                     }
                 }
-                LD_AC => self.regs.a = mmu[0xFF00 + self.regs.c as u16],
-                LD_CA => mmu[0xFF00 + self.regs.c as u16] = self.regs.a,
-                LD(ref r1, ref r2) => {
-                    match r1 {
-                        Operand::IndirectAddress(reg) => {
-                            let val = self.get_operand(r2, mmu);
-                            mmu[self.regs.get(*reg)] = val;
+                LD => {
+                    let value = self.get_operand(&instr.rhs.unwrap(), mmu);
+                    self.set_value(mmu, &instr.lhs.unwrap(), value);
+                }
+                LD16 => {
+                    let rhs = &instr.rhs.unwrap();
+
+
+                    match rhs {
+                        Operand::SpOffset => {
+                            let sp = self.regs.sp;
+                            let n = self.read_8(mmu) as i8 as i16 as u16;
+
+                            self.regs[Z] = false;
+                            self.regs[N] = false;
+                            self.regs[H] = (sp & 0x000F) + (n & 0x000F) > 0x000F;
+                            self.regs[C] = (sp & 0x00FF) + (n & 0x00FF) > 0x00FF;
+
+                            self.set_16bit_value(mmu, &instr.lhs.unwrap(), sp.wrapping_add(n));
                         }
-                        Operand::DirectAddress => {
-                            let addr = self.read_16(mmu);
-                            let val = self.get_operand(r2, mmu);
-                            mmu[addr] = val;
-                        }
-                        Operand::Register(reg) => {
-                            let val = self.get_operand(r2, mmu);
-                            self.regs[*reg] = val;
-                        }
-                        Operand::Register16(reg) => {
-                            let val = self.read_16(mmu);
-                            self.regs.set(*reg, val);
-                        }
-                        Operand::Byte => {
-                            // LD (nn), SP
-                            let addr = self.read_16(mmu);
-                            [mmu[addr], mmu[addr + 1]] = self.regs.sp.to_le_bytes();
+                        _ => {
+                            let value = self.get_16bit_operand(rhs, mmu);
+                            self.set_16bit_value(mmu, &instr.lhs.unwrap(), value);
                         }
                     }
                 }
-                LDH_An => self.regs.a = mmu[0xFF00 + self.read_8(mmu) as u16],
-                LDH_nA => {
-                    let offset = self.read_8(mmu) as u16;
-                    mmu[0xFF00 + offset] = self.regs.a
+                LDD => {
+                    let value = self.get_operand(&instr.rhs.unwrap(), mmu);
+                    self.set_value(mmu, &instr.lhs.unwrap(), value);
+                    self.regs.set(HL, self.regs.get(HL).wrapping_sub(1));
                 }
-                LDD_A_HL => {
-                    self.regs.a = mmu[self.regs.get(Register16Id::HL)];
-                    self.regs.set(Register16Id::HL, self.regs.get(Register16Id::HL) - 1);
-                }
-                LDD_HL_A => {
-                    mmu[self.regs.get(Register16Id::HL)] = self.regs.a;
-                    self.regs.set(Register16Id::HL, self.regs.get(Register16Id::HL) - 1);
-                }
-                LDI_A_HL => {
-                    self.regs.a = mmu[self.regs.get(Register16Id::HL)];
-                    self.regs.set(Register16Id::HL, self.regs.get(Register16Id::HL) + 1);
-                }
-                LDI_HL_A => {
-                    mmu[self.regs.get(Register16Id::HL)] = self.regs.a;
-                    self.regs.set(Register16Id::HL, self.regs.get(Register16Id::HL) + 1);
-                }
-                LD_SP_HL => self.regs.sp = self.regs.get(Register16Id::HL),
-                LDHL => {
-                    let sp = self.regs.sp;
-                    let n = self.read_8(mmu) as i8 as i16 as u16;
-
-                    self.regs[Z] = false;
-                    self.regs[N] = false;
-                    self.regs[H] = (sp & 0x000F) + (n & 0x000F) > 0x000F;
-                    self.regs[C] = (sp & 0x00FF) + (n & 0x00FF) > 0x00FF;
-
-                    self.regs.set(Register16Id::HL, sp.wrapping_add(n));
+                LDI => {
+                    let value = self.get_operand(&instr.rhs.unwrap(), mmu);
+                    self.set_value(mmu, &instr.lhs.unwrap(), value);
+                    self.regs.set(HL, self.regs.get(HL).wrapping_add(1));
                 }
                 NOP => {}
-                OR(ref op) => {
-                    let n = self.get_operand(op, mmu);
+                OR => {
+                    let n = self.get_operand(&instr.lhs.unwrap(), mmu);
                     self.regs.a = self.regs.a | n;
 
                     self.regs[Z] = self.regs.a == 0;
@@ -482,64 +462,49 @@ impl Cpu {
                     self.regs[H] = false;
                     self.regs[C] = false;
                 }
-                POP(reg) => {
+                POP => {
                     let val = self.pop_stack(mmu);
-                    self.regs.set(reg, val);
+                    self.set_16bit_value(mmu, &instr.lhs.unwrap(), val);
                 }
-                PUSH(reg) => self.push_stack(self.regs.get(reg), mmu),
-                RES(bit, reg) => {
-                    match reg {
-                        RegisterId::HL => {
-                            let mut n = mmu[self.regs.get(Register16Id::HL)];
-                            n = n & (0xFF ^ (1 << bit));
-                            mmu[self.regs.get(Register16Id::HL)] = n;
-                        }
-                        _ => {
-                            let mut n = self.regs[reg];
-                            n = n & (0xFF ^ (1 << bit));
-                            self.regs[reg] = n;
-                        }
-                    }
+                PUSH => {
+                    let addr = self.get_16bit_operand(&instr.lhs.unwrap(), mmu);
+                    self.push_stack(addr, mmu)
+                },
+                RES => {
+                    let lhs = &instr.lhs.unwrap();
+                    let rhs = &instr.rhs.unwrap();
+                    let bit = self.get_operand(lhs, mmu);
+                    let mut n = self.get_operand(rhs, mmu);
+                    n = n & (0xFF ^ (1 << bit));
+                    self.set_value(mmu, rhs, n);
                 }
                 RET => {
-                    let addr = self.pop_stack(mmu);
-                    self.set_pc(addr);
+                    let cond = match instr.lhs {
+                        Some(Operand::Flag(flag)) => self.regs.flags.get(&flag),
+                        _ => true
+                    };
+                    if cond {
+                        let addr = self.pop_stack(mmu);
+                        self.set_pc(addr);
+                    }
                 }
                 RETI => {
                     let addr = self.pop_stack(mmu);
                     self.set_pc(addr);
                     // TODO enable interrupts
                 }
-                RET_flag(flag) => {
-                    if self.regs.flags.get(flag) {
-                        let addr = self.pop_stack(mmu);
-                        self.set_pc(addr);
-                    }
-                }
-                RL(op) => {
-                    match op {
-                        Operand::Register(reg) => {
-                            let bit7 = self.regs[reg] >> 7 != 0;
-                            let carry_bit = if self.regs[C] { 1 } else { 0 } as u8;
-                            self.regs[reg] = self.regs[reg] << 1 | carry_bit;
+                RL => {
+                    let lhs = &instr.lhs.unwrap();
+                    let carry_bit = if self.regs[C] { 1 } else { 0 } as u8;
+                    let val = self.get_operand(lhs, mmu);
+                    let bit7 = val >> 7 != 0;
+                    let rotated = val << 1 | carry_bit;
+                    self.set_value(mmu, lhs, rotated);
 
-                            self.regs[Z] = self.regs[reg] == 0;
-                            self.regs[N] = false;
-                            self.regs[H] = false;
-                            self.regs[C] = bit7;
-                        }
-                        Operand::IndirectAddress(Register16Id::HL) => {
-                            let bit7 = mmu[self.regs.get(Register16Id::HL)] >> 7 != 0;
-                            let carry_bit = if self.regs[C] { 1 } else { 0 } as u8;
-                            mmu[self.regs.get(Register16Id::HL)] = mmu[self.regs.get(Register16Id::HL)] << 1 | carry_bit;
-
-                            self.regs[Z] = mmu[self.regs.get(Register16Id::HL)] == 0;
-                            self.regs[N] = false;
-                            self.regs[H] = false;
-                            self.regs[C] = bit7;
-                        }
-                        _ => panic!("Unsupported RLC operand {:?}", op)
-                    }
+                    self.regs[Z] = rotated == 0;
+                    self.regs[N] = false;
+                    self.regs[H] = false;
+                    self.regs[C] = bit7;
                 }
                 RLA => {
                     let bit7 = self.regs.a >> 7 != 0;
@@ -550,26 +515,14 @@ impl Cpu {
                     self.regs[H] = false;
                     self.regs[C] = bit7;
                 }
-                RLC(op) => {
-                    match op {
-                        Operand::Register(reg) => {
-                            let val = self.regs[reg].rotate_left(1);
-                            self.regs[reg] = val;
-                            self.regs[Z] = val == 0;
-                            self.regs[N] = false;
-                            self.regs[H] = false;
-                            self.regs[C] = (val & 0x01) == 0x01;
-                        }
-                        Operand::IndirectAddress(Register16Id::HL) => {
-                            let val = mmu[self.regs.get(Register16Id::HL)].rotate_left(1);
-                            mmu[self.regs.get(Register16Id::HL)] = val;
-                            self.regs[Z] = val == 0;
-                            self.regs[N] = false;
-                            self.regs[H] = false;
-                            self.regs[C] = (val & 0x01) == 0x01;
-                        }
-                        _ => panic!("Unsupported RLC operand {:?}", op)
-                    }
+                RLC => {
+                    let lhs = &instr.lhs.unwrap();
+                    let val = self.get_operand(lhs, mmu).rotate_left(1);
+                    self.set_value(mmu, lhs, val);
+                    self.regs[Z] = val == 0;
+                    self.regs[N] = false;
+                    self.regs[H] = false;
+                    self.regs[C] = (val & 0x01) == 0x01;
                 }
                 RLCA => {
                     self.regs.a = self.regs.a.rotate_left(1);
@@ -578,30 +531,17 @@ impl Cpu {
                     self.regs[H] = false;
                     self.regs[C] = self.regs.a & 0x01 != 0;
                 }
-                RR(op) => {
-                    match op {
-                        Operand::Register(reg) => {
-                            let bit0 = self.regs[reg] & 0x01 != 0;
-                            let carry_bit = if self.regs[C] { 1 } else { 0 } as u8;
-                            self.regs[reg] = self.regs[reg] >> 1 | carry_bit << 7;
+                RR => {
+                    let lhs = &instr.lhs.unwrap();
+                    let carry_bit = if self.regs[C] { 1 } else { 0 } as u8;
+                    let val = self.get_operand(lhs, mmu);
+                    let bit0 = val & 0x01 != 0;
+                    self.set_value(mmu, lhs, val >> 1 | carry_bit << 7);
 
-                            self.regs[Z] = self.regs[reg] == 0;
-                            self.regs[N] = false;
-                            self.regs[H] = false;
-                            self.regs[C] = bit0;
-                        }
-                        Operand::IndirectAddress(Register16Id::HL) => {
-                            let bit0 = mmu[self.regs.get(Register16Id::HL)] & 0x01 != 0;
-                            let carry_bit = if self.regs[C] { 1 } else { 0 } as u8;
-                            mmu[self.regs.get(Register16Id::HL)] = mmu[self.regs.get(Register16Id::HL)] >> 1 | carry_bit << 7;
-
-                            self.regs[Z] = mmu[self.regs.get(Register16Id::HL)] == 0;
-                            self.regs[N] = false;
-                            self.regs[H] = false;
-                            self.regs[C] = bit0;
-                        }
-                        _ => panic!("Unsupported RLC operand {:?}", op)
-                    }
+                    self.regs[Z] = self.get_operand(lhs, mmu) == 0;
+                    self.regs[N] = false;
+                    self.regs[H] = false;
+                    self.regs[C] = bit0;
                 }
                 RRA => {
                     let bit0 = self.regs.a & 0x01 != 0;
@@ -612,26 +552,14 @@ impl Cpu {
                     self.regs[H] = false;
                     self.regs[C] = bit0;
                 }
-                RRC(op) => {
-                    match op {
-                        Operand::Register(reg) => {
-                            let val = self.regs[reg].rotate_right(1);
-                            self.regs[reg] = val;
-                            self.regs[Z] = val == 0;
-                            self.regs[N] = false;
-                            self.regs[H] = false;
-                            self.regs[C] = (val & 0x80) == 0x80;
-                        }
-                        Operand::IndirectAddress(Register16Id::HL) => {
-                            let val = mmu[self.regs.get(Register16Id::HL)].rotate_right(1);
-                            mmu[self.regs.get(Register16Id::HL)] = val;
-                            self.regs[Z] = val == 0;
-                            self.regs[N] = false;
-                            self.regs[H] = false;
-                            self.regs[C] = (val & 0x80) == 0x80;
-                        }
-                        _ => panic!("Unsupported RLC operand {:?}", op)
-                    }
+                RRC => {
+                    let lhs = &instr.lhs.unwrap();
+                    let val = self.get_operand(lhs, mmu).rotate_right(1);
+                    self.set_value(mmu, lhs, val);
+                    self.regs[Z] = val == 0;
+                    self.regs[N] = false;
+                    self.regs[H] = false;
+                    self.regs[C] = (val & 0x80) == 0x80;
                 }
                 RRCA => {
                     self.regs.a = self.regs.a.rotate_right(1);
@@ -640,14 +568,14 @@ impl Cpu {
                     self.regs[H] = false;
                     self.regs[C] = self.regs.a & 0x80 != 0;
                 }
-                RST(offset) => {
+                RST => {
                     self.push_stack(self.regs.pc, mmu);
-                    self.set_pc(0x0000 + offset as u16);
-                    //panic!("Reset to {:#06x}", self.regs.pc)
+                    let offset = self.get_operand(&instr.lhs.unwrap(), mmu) as u16;
+                    self.set_pc(0x0000 + offset);
                 }
-                SBC(ref op) => {
+                SBC => {
                     let carry = if self.regs[C] { 1 } else { 0 };
-                    let n = self.get_operand(op, mmu);
+                    let n = self.get_operand(&instr.lhs.unwrap(), mmu);
 
                     let (sub, new_carry) = calc_with_carry(vec![self.regs.a, n, carry], |a, b| a.overflowing_sub(b));
 
@@ -663,69 +591,57 @@ impl Cpu {
                     self.regs[H] = false;
                     self.regs[C] = true;
                 }
-                SET(bit, reg) => {
-                    match reg {
-                        RegisterId::HL => {
-                            let mut n = mmu[self.regs.get(Register16Id::HL)];
-                            n = n | (1 << bit);
-                            mmu[self.regs.get(Register16Id::HL)] = n;
-                        }
-                        _ => {
-                            let mut n = self.regs[reg];
-                            n = n | (1 << bit);
-                            self.regs[reg] = n;
-                        }
-                    }
+                SET => {
+                    let lhs = &instr.lhs.unwrap();
+                    let rhs = &instr.rhs.unwrap();
+                    let bit = self.get_operand(lhs, mmu);
+                    let mut n = self.get_operand(rhs, mmu);
+                    n = n | (1 << bit);
+                    self.set_value(mmu, rhs, n);
                 }
-                SLA(op) => {
-                    let val = match op {
-                        Operand::Register(reg) => &mut self.regs[reg],
-                        Operand::IndirectAddress(Register16Id::HL) => &mut mmu[self.regs.get(Register16Id::HL)],
-                        _ => panic!("Unsupported RLC operand {:?}", op)
-                    };
+                SLA => {
+                    let lhs = &instr.lhs.unwrap();
+                    let val = self.get_operand(lhs, mmu);
+                    let bit7 = val & 0x80 == 0x80;
+                    let shifted = val << 1;
 
-                    let bit7 = *val & 0x80 == 0x80;
-                    *val = *val << 1;
+                    self.set_value(mmu, lhs, shifted);
 
-                    self.regs[Z] = *val == 0;
+                    self.regs[Z] = shifted == 0;
                     self.regs[N] = false;
                     self.regs[H] = false;
                     self.regs[C] = bit7;
                 }
-                SRA(op) => {
-                    let val = match op {
-                        Operand::Register(reg) => &mut self.regs[reg],
-                        Operand::IndirectAddress(Register16Id::HL) => &mut mmu[self.regs.get(Register16Id::HL)],
-                        _ => panic!("Unsupported RLC operand {:?}", op)
-                    };
+                SRA => {
+                    let lhs = &instr.lhs.unwrap();
+                    let val = self.get_operand(lhs, mmu);
+                    let bit7 = val & 0x80;
+                    let bit0 = val & 0x01 == 0x01;
+                    let shifted = (val >> 1) | bit7;
 
-                    let bit7 = *val & 0x80;
-                    let bit0 = *val & 0x01 == 0x01;
-                    *val = (*val >> 1) | bit7;
+                    self.set_value(mmu, lhs, shifted);
 
-                    self.regs[Z] = *val == 0;
+                    self.regs[Z] = shifted == 0;
                     self.regs[N] = false;
                     self.regs[H] = false;
                     self.regs[C] = bit0;
                 }
-                SRL(op) => {
-                    let val = match op {
-                        Operand::Register(reg) => &mut self.regs[reg],
-                        Operand::IndirectAddress(Register16Id::HL) => &mut mmu[self.regs.get(Register16Id::HL)],
-                        _ => panic!("Unsupported RLC operand {:?}", op)
-                    };
+                SRL => {
+                    let lhs = &instr.lhs.unwrap();
+                    let val = self.get_operand(lhs, mmu);
+                    let bit0 = val & 0x01 == 0x01;
+                    let shifted = val >> 1;
 
-                    let bit0 = *val & 0x01 == 0x01;
-                    *val = *val >> 1;
+                    self.set_value(mmu, lhs, shifted);
 
-                    self.regs[Z] = *val == 0;
+                    self.regs[Z] = shifted == 0;
                     self.regs[N] = false;
                     self.regs[H] = false;
                     self.regs[C] = bit0;
                 }
                 STOP => break 'execution,
-                SUB(ref op) => {
-                    let n = self.get_operand(op, mmu);
+                SUB => {
+                    let n = self.get_operand(&instr.lhs.unwrap(), mmu);
                     let (sub, carry) = calc_with_carry(vec![self.regs.a, n, 0], |a, b| a.overflowing_sub(b));
 
                     self.regs[Z] = sub == 0;
@@ -735,36 +651,26 @@ impl Cpu {
 
                     self.regs.a = sub;
                 }
-                SWAP(op) => {
-                    match op {
-                        Operand::IndirectAddress(Register16Id::HL) => {
-                            let val = mmu[self.regs.get(Register16Id::HL)];
-                            let swapped = ((val & 0x0F) << 4) | ((val & 0xF0) >> 4);
-                            mmu[self.regs.get(Register16Id::HL)] = swapped;
-                            self.regs[Z] = swapped == 0;
-                            self.regs[N] = false;
-                            self.regs[H] = false;
-                            self.regs[C] = false;
-                        }
-                        Operand::Register(reg) => {
-                            let swapped = ((self.regs[reg] & 0x0F) << 4) | ((self.regs[reg] & 0xF0) >> 4);
-                            self.regs[reg] = swapped;
-                            self.regs[Z] = swapped == 0;
-                            self.regs[N] = false;
-                            self.regs[H] = false;
-                            self.regs[C] = false;
-                        }
-                        _ => panic!("Unsupported SWAP operand {:?}", op),
-                    }
+                SWAP => {
+                    let lhs = &instr.lhs.unwrap();
+                    let val = self.get_operand(lhs, mmu);
+                    let swapped = ((val & 0x0F) << 4) | ((val & 0xF0) >> 4);
+
+                    self.set_value(mmu, lhs, swapped);
+                    self.regs[Z] = swapped == 0;
+                    self.regs[N] = false;
+                    self.regs[H] = false;
+                    self.regs[C] = false;
                 }
-                XOR(ref op) => {
-                    let n = self.get_operand(op, mmu);
+                XOR => {
+                    let n = self.get_operand(&instr.lhs.unwrap(), mmu);
                     self.regs.a = self.regs.a.bitxor(n);
                     self.regs[Z] = self.regs.a == 0;
                     self.regs[N] = false;
                     self.regs[H] = false;
                     self.regs[C] = false;
                 }
+                _ => panic!("{:?}", instr.kind)
             }
         }
     }
@@ -801,13 +707,53 @@ impl Cpu {
             Operand::Byte => {
                 self.read_8(mmu)
             }
+            Operand::Register(reg) => self.regs[*reg],
+            Operand::Value(val) => *val,
+            Operand::IoPort(reg) => mmu[0xFF00 + self.regs[*reg] as u16],
+            Operand::IoPortOffset => mmu[0xFF00 + self.read_8(mmu) as u16],
+            _=> panic!("{:?}", op)
+        }
+    }
+
+    fn get_16bit_operand(&mut self, op: &Operand, mmu: &Mmu) -> u16 {
+        match op {
+            Operand::Register16(reg) => self.regs.get(*reg),
+            Operand::Byte => self.read_16(mmu),
+            _=> panic!("{:?}", op)
+        }
+    }
+
+    fn set_value(&mut self, mmu: &mut Mmu, op: &Operand, value: u8) {
+        match op {
             Operand::Register(reg) => {
-                match reg {
-                    RegisterId::HL => mmu[self.regs.get(Register16Id::HL)],
-                    _ => self.regs[*reg]
-                }
+                self.regs[*reg] = value;
             }
-            Operand::Register16(reg) => mmu[self.regs.get(*reg)],
+            Operand::IndirectAddress(reg) => {
+                mmu[self.regs.get(*reg)] = value;
+            }
+            Operand::DirectAddress => {
+                let addr = self.read_16(mmu);
+                mmu[addr] = value;
+            }
+            Operand::IoPort(reg) => mmu[0xFF00 + self.regs[*reg] as u16] = value,
+            Operand::IoPortOffset => {
+                let offset = self.read_8(mmu) as u16;
+                mmu[0xFF00 + offset] = value;
+            },
+            _ => panic!("{:?}", op),
+        }
+    }
+
+    fn set_16bit_value(&mut self, mmu: &mut Mmu, op: &Operand, value: u16) {
+        match op {
+            Operand::Register16(reg) => {
+                self.regs.set(*reg, value);
+            }
+            Operand::Byte => {
+                let addr = self.read_16(mmu);
+                [mmu[addr], mmu[addr + 1]] = value.to_le_bytes();
+            }
+            _ => panic!("{:?}", op)
         }
     }
 
@@ -819,7 +765,6 @@ impl Cpu {
         self.regs.sp -= 1;
         mmu[self.regs.sp] = lo;
     }
-
     fn pop_stack(&mut self, mmu: &mut Mmu) -> u16 {
         let lo = mmu[self.regs.sp];
         self.regs.sp += 1;
