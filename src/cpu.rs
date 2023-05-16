@@ -1,5 +1,4 @@
 use std::ops::{BitAnd, BitXor, Index, IndexMut};
-use std::time::SystemTime;
 
 use Command::*;
 
@@ -180,8 +179,6 @@ pub fn init_cpu() -> Cpu {
 
 impl Cpu {
     pub fn run(self: &mut Cpu, mmu: &mut Mmu) {
-        let mut ly_last_refresh = SystemTime::now();
-
         'execution: loop {
             let opcode = Command::try_from((mmu[self.regs.pc], mmu[self.regs.pc + 1]))
                 .unwrap_or_else(|_| {
@@ -768,13 +765,6 @@ impl Cpu {
                     self.regs[H] = false;
                     self.regs[C] = false;
                 }
-            }
-
-            let now = SystemTime::now();
-
-            if now.duration_since(ly_last_refresh).unwrap().as_millis() > 0 {
-                ly_last_refresh = now;
-                //mmu[0xFF44] = (mmu[0xFF44].overflowing_add(1).0) % 153;
             }
         }
     }
